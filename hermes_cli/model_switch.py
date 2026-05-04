@@ -1025,6 +1025,59 @@ def list_authenticated_providers(
     results: List[dict] = []
     seen_slugs: set = set()  # lowercase-normalized to catch case variants (#9545)
     seen_mdev_ids: set = set()  # prevent duplicate entries for aliases (e.g. kimi-coding + kimi-coding-cn)
+
+    # Honor config.yaml model_catalog.providers in the gateway/CLI model picker.
+    # Without this, credential discovery below re-adds "ghost" providers from
+    # env vars, OAuth stores, and CANONICAL_PROVIDERS even when the catalog UI
+    # explicitly disables them.
+    _catalog_enabled: set[str] = set()
+    _catalog_disabled: set[str] = set()
+    try:
+        from hermes_cli.config import load_config as _load_config
+        _mcfg = (_load_config().get("model_catalog", {}) or {}).get("providers", {}) or {}
+        for _slug, _entry in _mcfg.items():
+            _norm = str(_slug or "").strip().lower().replace("_", "-")
+            if not _norm or not isinstance(_entry, dict):
+                continue
+            if _entry.get("enabled") is False:
+                _catalog_disabled.add(_norm)
+            elif _entry.get("enabled") is True:
+                _catalog_enabled.add(_norm)
+    except Exception:
+        pass
+
+    _provider_aliases = {
+        "x-ai": {"x-ai", "xai", "grok"},
+        "xai": {"x-ai", "xai", "grok"},
+        "grok": {"x-ai", "xai", "grok"},
+        "github-copilot": {"github", "github-copilot", "github_copilot", "copilot", "copilot-acp"},
+        "github": {"github", "github-copilot", "github_copilot", "copilot", "copilot-acp"},
+        "copilot": {"github", "github-copilot", "github_copilot", "copilot", "copilot-acp"},
+        "copilot-acp": {"github", "github-copilot", "github_copilot", "copilot", "copilot-acp"},
+        "openai-codex": {"openai-codex", "codex"},
+        "codex": {"openai-codex", "codex"},
+    }
+
+    def _catalog_names(*slugs: str) -> set[str]:
+        names: set[str] = set()
+        for slug in slugs:
+            norm = str(slug or "").strip().lower().replace("_", "-")
+            if not norm:
+                continue
+            names.add(norm)
+            names.update(_provider_aliases.get(norm, set()))
+        return names
+
+    def _catalog_allows_builtin(*slugs: str) -> bool:
+        names = _catalog_names(*slugs)
+        if names & _catalog_disabled:
+            return False
+        # If any providers are explicitly enabled, treat that as an allowlist
+        # for built-ins. User-defined endpoints below are handled separately.
+        if _catalog_enabled and not (names & _catalog_enabled):
+            return False
+        return True
+
     # Effective base URLs of every built-in row we emit (normalized lower+rstrip).
     # Section 4 uses this to hide ``custom_providers`` entries that point at the
     # same endpoint as a built-in (e.g. a user-defined "my-dashscope" on
@@ -1100,6 +1153,8 @@ def list_authenticated_providers(
 
     # --- 1. Check Hermes-mapped providers ---
     for hermes_id, mdev_id in PROVIDER_TO_MODELS_DEV.items():
+        if not _catalog_allows_builtin(hermes_id, mdev_id):
+            continue
         # Skip aliases that map to the same models.dev provider (e.g.
         # kimi-coding and kimi-coding-cn both → kimi-for-coding).
         # The first one with valid credentials wins (#10526).
@@ -1174,11 +1229,13 @@ def list_authenticated_providers(
     _mdev_to_hermes = {v: k for k, v in PROVIDER_TO_MODELS_DEV.items()}
 
     for pid, overlay in HERMES_OVERLAYS.items():
+        # Resolve Hermes slug — e.g. "github-copilot" → "copilot"
+        hermes_slug = _mdev_to_hermes.get(pid, pid)
+        if not _catalog_allows_builtin(pid, hermes_slug):
+            continue
         if pid.lower() in seen_slugs:
             continue
 
-        # Resolve Hermes slug — e.g. "github-copilot" → "copilot"
-        hermes_slug = _mdev_to_hermes.get(pid, pid)
         if hermes_slug.lower() in seen_slugs:
             continue
 
@@ -1289,6 +1346,8 @@ def list_authenticated_providers(
         _canon_provs = []
 
     for _cp in _canon_provs:
+        if not _catalog_allows_builtin(_cp.slug):
+            continue
         if _cp.slug.lower() in seen_slugs:
             continue
 
@@ -1369,6 +1428,8 @@ def list_authenticated_providers(
     _section3_emitted_pairs: set = set()
     if user_providers and isinstance(user_providers, dict):
         for ep_name, ep_cfg in user_providers.items():
+            if _catalog_names(ep_name) & _catalog_disabled:
+                continue
             if not isinstance(ep_cfg, dict):
                 continue
             # Skip if this slug was already emitted (e.g. canonical provider
@@ -1481,6 +1542,8 @@ def list_authenticated_providers(
                 continue
 
             raw_name = (entry.get("name") or "").strip()
+            if _catalog_names(raw_name, custom_provider_slug(raw_name)) & _catalog_disabled:
+                continue
             api_url = (
                 entry.get("base_url", "")
                 or entry.get("url", "")
