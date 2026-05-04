@@ -85,6 +85,7 @@ from gateway.platforms.telegram_network import (
     parse_fallback_ip_env,
 )
 from utils import atomic_replace
+from gateway import sophie_meadow_capture
 
 
 def check_telegram_requirements() -> bool:
@@ -1555,12 +1556,19 @@ class TelegramAdapter(BasePlatformAdapter):
             keyboard = InlineKeyboardMarkup(rows)
 
             provider_label = get_label(current_provider)
+
+            def _tg_escape(s):
+                """Escape Markdown special chars for Telegram's legacy parser."""
+                for ch in ('_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'):
+                    s = s.replace(ch, f'\\{ch}')
+                return s
+
             text = (
-                f"⚙ *Model Configuration*\n\n"
-                f"Current model: `{current_model or 'unknown'}`\n"
-                f"Provider: {provider_label}\n\n"
+                f"*Model Configuration*\n\n"
+                f"Current model: {_tg_escape(current_model or 'unknown')}\n"
+                f"Provider: {_tg_escape(provider_label)}\n\n"
                 f"Select a provider:"
-            )
+              )
 
             thread_id = metadata.get("thread_id") if metadata else None
             msg = await self._bot.send_message(
@@ -2827,6 +2835,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not update.message or not update.message.text:
             return
+        if await sophie_meadow_capture.maybe_capture(self, update.message):
+            return
         if not self._should_process_message(update.message):
             return
 
@@ -3006,6 +3016,8 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
         if not update.message:
+            return
+        if await sophie_meadow_capture.maybe_capture(self, update.message):
             return
         if not self._should_process_message(update.message):
             return
